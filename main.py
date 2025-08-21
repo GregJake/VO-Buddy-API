@@ -107,4 +107,4 @@ def heuristics_to_notes(metrics: dict, specs: str, script: str) -> List[str]:
         notes.append("Avoid the announcer lift—keep it talky and grounded.")
 
     if not script:
-        notes.append("E
+        notes.append("Energy felt low, try increasing enthusiasm.")
