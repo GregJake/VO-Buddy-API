@@ -1,15 +1,17 @@
 # main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi import UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, List
-import base64, tempfile, os, math, re
 from openai import OpenAI
-from fastapi import UploadFile, File, Form, HTTPException
+
 import base64
+import tempfile
+import os
+import re
 
-
-app = FastAPI(title="VO Buddy API", version="0.2.0")
+app = FastAPI(title="VO Buddy API", version="0.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,51 +23,30 @@ app.add_middleware(
 
 # ---------- Models ----------
 class AnalyzeReq(BaseModel):
-    audio: Dict[str, str]              # {"base64": "<...>"}
+    # expects: {"audio": {"base64": "..."}}
+    audio: Dict[str, str]
     filename: Optional[str] = None
     specs: Optional[str] = ""
     script: Optional[str] = ""
     style_bank: Optional[bool] = False
-    @app.post("/analyze-multipart")
-async def analyze_multipart(
-    audio_file: UploadFile = File(...),
-    specs: str = Form(""),
-    script: str = Form(""),
-    style_bank: bool = Form(False),
-):
-    """
-    Accepts a real file upload from the browser (multipart/form-data),
-    converts it to base64 internally, and routes to the same analyzer.
-    """
-    try:
-        raw = await audio_file.read()
-        b64 = base64.b64encode(raw).decode("utf-8")
-
-        req = AnalyzeReq(
-            audio={"base64": b64},
-            filename=audio_file.filename or "upload.wav",
-            specs=specs,
-            script=script,
-            style_bank=style_bank,
-        )
-        return analyze(req)  # ← calls your existing JSON endpoint logic
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"analyze-multipart failed: {e}")
 
 
 class AnalyzeResp(BaseModel):
     notes: List[str]
     altReads: List[str]
-    meta: Dict[str, Optional[float]]   # for debugging/QA: duration, wpm, longest_pause
+    meta: Dict[str, Optional[float]]   # duration, wpm, longest_pause, cta_present
 
 # ---------- Utils ----------
-CTA_WORDS = {"call","visit","today","now","shop","learn","sign","download","subscribe","join","try","order","book"}
+CTA_WORDS = {
+    "call", "visit", "today", "now", "shop", "learn", "sign",
+    "download", "subscribe", "join", "try", "order", "book"
+}
 
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def detect_cta(text: str) -> bool:
-    t = text.lower()
+    t = (text or "").lower()
     return any(w in t for w in CTA_WORDS)
 
 def compute_wpm(word_count: int, duration_s: float) -> Optional[float]:
@@ -77,7 +58,7 @@ def segment_gaps(segments) -> List[float]:
     """Return list of pauses between segments in seconds."""
     gaps = []
     for i in range(1, len(segments)):
-        prev_end = segments[i-1].get("end", 0)
+        prev_end = segments[i - 1].get("end", 0)
         cur_start = segments[i].get("start", 0)
         gap = max(0.0, float(cur_start) - float(prev_end))
         if gap >= 0.15:  # ignore micro gaps
@@ -133,7 +114,8 @@ def human_notes(metrics: dict, specs: str, script: str) -> List[str]:
     seen, out = set(), []
     for n in notes:
         if n not in seen:
-            seen.add(n); out.append(n)
+            seen.add(n)
+            out.append(n)
     return out[:4] if out else ["Clean read—keep it conversational and let the last word land."]
 
 def alt_reads(specs: str) -> List[str]:
@@ -141,21 +123,21 @@ def alt_reads(specs: str) -> List[str]:
     if "retail" in s or "upbeat" in s:
         return [
             "Ride a quicker beat; punch the urgency words; crisp articulation.",
-            "Smile only on the benefit—keep the sell light and precise."
+            "Smile only on the benefit—keep the sell light and precise.",
         ]
     if "luxury" in s or "aspirational" in s:
         return [
             "Slow the cadence a hair; lower the pitch floor; warm restraint.",
-            "Let each keyword ring—zero sell on the last word."
+            "Let each keyword ring—zero sell on the last word.",
         ]
     if "corporate" in s or "b2b" in s:
         return [
             "Neutral warmth; articulate transitions; steady pace.",
-            "Lead with clarity—tiny breath before important terms."
+            "Lead with clarity—tiny breath before important terms.",
         ]
     return [
         "Talk to one person—half-smile on the benefit; downstep the last three words.",
-        "Add a micro-pause before the CTA verb and let it ring."
+        "Add a micro-pause before the CTA verb and let it ring.",
     ]
 
 # ---------- OpenAI client ----------
@@ -168,7 +150,7 @@ def openai_client() -> OpenAI:
 # ---------- Routes ----------
 @app.get("/")
 def home():
-    return {"ok": True, "service": "vo-buddy-api", "endpoints": ["/analyze", "/docs", "/healthz"]}
+    return {"ok": True, "service": "vo-buddy-api", "endpoints": ["/analyze", "/analyze-multipart", "/docs", "/healthz"]}
 
 @app.get("/healthz")
 def health():
@@ -183,13 +165,20 @@ def analyze(req: AnalyzeReq):
     4) Map to Greg-style notes + alt reads
     """
     # --- 1) decode audio to temp file
-    b64 = req.audio.get("base64", "")
+    b64 = (req.audio or {}).get("base64", "")
     if not b64:
         # Graceful fallback: no audio posted
-        metrics = {"duration": 0.0, "wpm": None, "longest_pause": 0.0, "cta_present": detect_cta(req.script or "")}
-        return AnalyzeResp(notes=human_notes(metrics, req.specs or "", req.script or ""),
-                           altReads=alt_reads(req.specs or ""),
-                           meta=metrics)
+        metrics = {
+            "duration": 0.0,
+            "wpm": None,
+            "longest_pause": 0.0,
+            "cta_present": detect_cta(req.script or "")
+        }
+        return AnalyzeResp(
+            notes=human_notes(metrics, req.specs or "", req.script or ""),
+            altReads=alt_reads(req.specs or ""),
+            meta=metrics,
+        )
 
     raw = base64.b64decode(b64)
     suffix = ".wav" if (req.filename or "").lower().endswith(".wav") else ".mp3"
@@ -205,18 +194,16 @@ def analyze(req: AnalyzeReq):
                 model="whisper-1",
                 file=af,
                 response_format="verbose_json",   # returns segments with start/end
-                temperature=0.0
+                temperature=0.0,
             )
 
-        # Fallback handling if fields missing
-        segments = tr.segments or []
-        text = tr.text or ""
+        segments = getattr(tr, "segments", None) or []
+        text = getattr(tr, "text", "") or ""
 
         # --- 3) metrics from segments
         if segments:
             duration = float(segments[-1].get("end", 0.0))
         else:
-            # If no segments, try duration from whisper metadata or fall back to 0
             duration = float(getattr(tr, "duration", 0.0) or 0.0)
 
         words = len(re.findall(r"\b[\w']+\b", text))
@@ -242,3 +229,31 @@ def analyze(req: AnalyzeReq):
             os.remove(tmp_path)
         except Exception:
             pass
+
+# ---------- Multipart endpoint (file upload) ----------
+@app.post("/analyze-multipart")
+async def analyze_multipart(
+    audio_file: UploadFile = File(...),
+    specs: str = Form(""),
+    script: str = Form(""),
+    style_bank: bool = Form(False),
+):
+    """
+    Accepts a real file upload from the browser (multipart/form-data),
+    converts it to base64 internally, and routes to the same analyzer.
+    """
+    try:
+        raw = await audio_file.read()
+        b64 = base64.b64encode(raw).decode("utf-8")
+
+        req = AnalyzeReq(
+            audio={"base64": b64},
+            filename=audio_file.filename or "upload.wav",
+            specs=specs,
+            script=script,
+            style_bank=style_bank,
+        )
+        # Reuse the same logic as the JSON endpoint
+        return analyze(req)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"analyze-multipart failed: {e}")
