@@ -5,6 +5,9 @@ from pydantic import BaseModel
 from typing import Optional, Dict, List
 import base64, tempfile, os, math, re
 from openai import OpenAI
+from fastapi import UploadFile, File, Form, HTTPException
+import base64
+
 
 app = FastAPI(title="VO Buddy API", version="0.2.0")
 
@@ -23,6 +26,32 @@ class AnalyzeReq(BaseModel):
     specs: Optional[str] = ""
     script: Optional[str] = ""
     style_bank: Optional[bool] = False
+    @app.post("/analyze-multipart")
+async def analyze_multipart(
+    audio_file: UploadFile = File(...),
+    specs: str = Form(""),
+    script: str = Form(""),
+    style_bank: bool = Form(False),
+):
+    """
+    Accepts a real file upload from the browser (multipart/form-data),
+    converts it to base64 internally, and routes to the same analyzer.
+    """
+    try:
+        raw = await audio_file.read()
+        b64 = base64.b64encode(raw).decode("utf-8")
+
+        req = AnalyzeReq(
+            audio={"base64": b64},
+            filename=audio_file.filename or "upload.wav",
+            specs=specs,
+            script=script,
+            style_bank=style_bank,
+        )
+        return analyze(req)  # ← calls your existing JSON endpoint logic
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"analyze-multipart failed: {e}")
+
 
 class AnalyzeResp(BaseModel):
     notes: List[str]
