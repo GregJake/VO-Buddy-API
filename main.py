@@ -3,7 +3,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 from openai import OpenAI
 
 import base64
@@ -11,7 +11,7 @@ import tempfile
 import os
 import re
 
-app = FastAPI(title="VO Buddy API", version="0.2.1")
+app = FastAPI(title="VO Buddy API", version="0.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,13 +54,19 @@ def compute_wpm(word_count: int, duration_s: float) -> Optional[float]:
         return None
     return (word_count / duration_s) * 60.0
 
+def _seg_get(seg: Any, field: str, default: float = 0.0) -> float:
+    """Read segment fields from either a dict or an object with attributes."""
+    if isinstance(seg, dict):
+        return float(seg.get(field, default) or 0.0)
+    return float(getattr(seg, field, default) or 0.0)
+
 def segment_gaps(segments) -> List[float]:
     """Return list of pauses between segments in seconds."""
-    gaps = []
+    gaps: List[float] = []
     for i in range(1, len(segments)):
-        prev_end = segments[i - 1].get("end", 0)
-        cur_start = segments[i].get("start", 0)
-        gap = max(0.0, float(cur_start) - float(prev_end))
+        prev_end = _seg_get(segments[i - 1], "end", 0.0)
+        cur_start = _seg_get(segments[i], "start", 0.0)
+        gap = max(0.0, cur_start - prev_end)
         if gap >= 0.15:  # ignore micro gaps
             gaps.append(gap)
     return gaps
@@ -190,19 +196,29 @@ def analyze(req: AnalyzeReq):
         # --- 2) transcription
         client = openai_client()
         with open(tmp_path, "rb") as af:
-            tr = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=af,
-                response_format="verbose_json",   # returns segments with start/end
-                temperature=0.0,
-            )
+            try:
+                tr = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=af,
+                    response_format="verbose_json",   # returns segments with start/end
+                    temperature=0.0,
+                )
+            except Exception as e:
+                # friendlier surface
+                msg = str(e)
+                if "insufficient_quota" in msg or "quota" in msg or "429" in msg:
+                    raise HTTPException(
+                        status_code=402,
+                        detail="Transcription is temporarily unavailable: OpenAI quota exhausted. Add billing or raise limit and try again."
+                    )
+                raise HTTPException(status_code=502, detail=f"Transcription failed: {msg}")
 
         segments = getattr(tr, "segments", None) or []
         text = getattr(tr, "text", "") or ""
 
         # --- 3) metrics from segments
         if segments:
-            duration = float(segments[-1].get("end", 0.0))
+            duration = _seg_get(segments[-1], "end", 0.0)
         else:
             duration = float(getattr(tr, "duration", 0.0) or 0.0)
 
@@ -255,5 +271,7 @@ async def analyze_multipart(
         )
         # Reuse the same logic as the JSON endpoint
         return analyze(req)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"analyze-multipart failed: {e}")
