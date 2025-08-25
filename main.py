@@ -89,4 +89,93 @@ def human_notes(metrics: dict, specs: str, script: str, deep: bool) -> List[str]
     # Specs awareness
     if "avoid announcer" in s: notes.append("Keep it talky—no announcer lift on the brand line.")
     if "retail" in s: notes.append("Hit the urgency words and keep the gaps tight.")
-    if "luxury" in s: notes.append("Ease off the sell; let keywords land
+    if "luxury" in s: notes.append("Ease off the sell; let keywords land softly with a warm finish.")
+    if "corporate" in s: notes.append("Prioritize clarity over hype; even tone, confident posture.")
+
+    # Script awareness
+    if not sc:
+        notes.append("If you paste the script, I’ll time emphasis and the CTA more precisely.")
+    elif has_cta:
+        notes.append("Let the CTA breathe—micro-pause before the verb so it rings.")
+
+    # Deep coaching extras
+    if deep:
+        notes.append("Think about whether you’re *telling* or *selling*—finesse vs. punch.")
+        notes.append("Decide if you’re the lead actor or support; let that color your choices.")
+        notes.append("Find the subtext—the words behind the words—and layer that in.")
+        notes.append("Break the script into acts; vary tempo, pitch, and energy across sections.")
+
+    # De-dup and cap
+    seen, out = set(), []
+    for n in notes:
+        if n not in seen: seen.add(n); out.append(n)
+    return out[:6] if out else ["Clean read—keep it conversational and let the last word land."]
+
+def alt_reads(specs: str) -> List[str]:
+    s = (specs or "").lower()
+    if "retail" in s: return ["Ride a quicker beat; punch urgency words.", "Smile only on the benefit—keep the sell light."]
+    if "luxury" in s: return ["Slow the cadence; lower pitch floor.", "Let each keyword ring—zero sell on the last word."]
+    if "corporate" in s: return ["Neutral warmth; steady pace.", "Lead with clarity—tiny breath before key terms."]
+    return ["Talk to one person—half-smile on the benefit.", "Add a micro-pause before the CTA verb and let it ring."]
+
+def openai_client() -> OpenAI:
+    key = os.getenv("OPENAI_API_KEY")
+    if not key: raise RuntimeError("OPENAI_API_KEY not set")
+    return OpenAI(api_key=key)
+
+# ------------------- Routes -------------------
+@app.get("/")
+def home():
+    return {"ok": True, "service": "vo-buddy-api", "endpoints": ["/analyze", "/docs", "/healthz"]}
+
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
+
+@app.post("/analyze", response_model=AnalyzeResp, dependencies=[Depends(verify_api_key)])
+def analyze(req: AnalyzeReq):
+    b64 = req.audio.get("base64", "")
+    if not b64:
+        metrics = {"duration": 0.0, "wpm": None, "longest_pause": 0.0, "cta_present": detect_cta(req.script or "")}
+        return AnalyzeResp(notes=human_notes(metrics, req.specs, req.script, req.deep),
+                           altReads=alt_reads(req.specs), meta=metrics)
+
+    raw = base64.b64decode(b64)
+    suffix = ".wav" if (req.filename or "").lower().endswith(".wav") else ".mp3"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
+        f.write(raw); tmp_path = f.name
+
+    try:
+        client = openai_client()
+        with open(tmp_path, "rb") as af:
+            tr = client.audio.transcriptions.create(model="whisper-1", file=af,
+                                                    response_format="verbose_json", temperature=0.0)
+        segments = tr.segments or []
+        text = tr.text or ""
+        duration = float(segments[-1].end if segments else getattr(tr, "duration", 0.0))
+        if duration > MAX_DURATION:
+            raise HTTPException(status_code=400, detail=f"Audio exceeds {MAX_DURATION} seconds.")
+        words = len(re.findall(r"\b[\w']+\b", text))
+        wpm = compute_wpm(words, duration)
+        gaps = segment_gaps([s.model_dump() for s in segments]) if segments else []
+        longest_pause = max(gaps) if gaps else 0.0
+        cta_present = detect_cta((req.script or "") + " " + text)
+        metrics = {"duration": round(duration, 2), "wpm": round(wpm, 1) if wpm else None,
+                   "longest_pause": round(longest_pause, 2), "cta_present": bool(cta_present)}
+        return AnalyzeResp(notes=human_notes(metrics, req.specs, req.script, req.deep),
+                           altReads=alt_reads(req.specs), meta=metrics)
+    finally:
+        try: os.remove(tmp_path)
+        except: pass
+
+@app.post("/analyze-multipart", dependencies=[Depends(verify_api_key)])
+async def analyze_multipart(audio_file: UploadFile = File(...), specs: str = Form(""),
+                            script: str = Form(""), style_bank: bool = Form(False), deep: bool = Form(False)):
+    try:
+        raw = await audio_file.read()
+        b64 = base64.b64encode(raw).decode("utf-8")
+        req = AnalyzeReq(audio={"base64": b64}, filename=audio_file.filename or "upload.wav",
+                         specs=specs, script=script, style_bank=style_bank, deep=deep)
+        return analyze(req)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"analyze-multipart failed: {e}")
