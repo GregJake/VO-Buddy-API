@@ -2,69 +2,58 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List
+import base64, tempfile, os, re, httpx, asyncio
+
 from openai import OpenAI
-import base64, tempfile, os, re
 
-# --- Configure your allowed origins ---
-ALLOWED_ORIGINS = [
-    "https://voboothbuddy.com",
-    "https://www.voboothbuddy.com",
-    # add your Wix site preview origin if needed, e.g. "https://editor.wix.com"
-]
-
-API_KEY_ENV = "API_KEY"  # set this env var in Render
-
-app = FastAPI(title="VO Buddy API", version="0.4.0")
+# ---------------- App & CORS (lock to your domain) ----------------
+ALLOWED_ORIGINS = ["https://voboothbuddy.com", "https://www.voboothbuddy.com"]
+app = FastAPI(title="VO Buddy API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=ALLOWED_ORIGINS,  # tighten to your domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- Models ----------
+# ---------------- Models ----------------
 class AnalyzeReq(BaseModel):
-    audio: Dict[str, str]              # {"base64": "..."}
+    audio: Dict[str, str]              # {"base64": "<...>"}
     filename: Optional[str] = None
     specs: Optional[str] = ""
     script: Optional[str] = ""
     style_bank: Optional[bool] = False
     deep: Optional[bool] = False
+    web_grounded: Optional[bool] = False  # NEW
 
 class AnalyzeResp(BaseModel):
     notes: List[str]
     altReads: List[str]
-    meta: Dict[str, Optional[float]]   # duration, wpm, longest_pause, cta_present
+    meta: Dict[str, Optional[float]]
+    sources: List[Dict[str, str]] = []    # NEW: [{"title": "...","url":"..."}]
 
-# ---------- Utils ----------
-CTA_WORDS = {
-    "call","visit","today","now","shop","learn","sign","download","subscribe","join","try","order","book"
-}
+# ---------------- Utils ----------------
+CTA_WORDS = {"call","visit","today","now","shop","learn","sign","download","subscribe","join","try","order","book"}
 
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def detect_cta(text: str) -> bool:
-    return any(w in (text or "").lower() for w in CTA_WORDS)
+    t = (text or "").lower()
+    return any(w in t for w in CTA_WORDS)
 
-def compute_wpm(word_count: int, duration_s: float) -> Optional[float]:
-    if duration_s <= 0 or word_count <= 0:
-        return None
+def compute_wpm(word_count: int, duration_s: float):
+    if duration_s <= 0 or word_count <= 0: return None
     return (word_count / duration_s) * 60.0
 
-def _seg_get(seg: Any, field: str, default: float = 0.0) -> float:
-    if isinstance(seg, dict):
-        return float(seg.get(field, default) or 0.0)
-    return float(getattr(seg, field, default) or 0.0)
-
 def segment_gaps(segments) -> List[float]:
-    gaps: List[float] = []
-    for i in range(1, len(segments)):
-        prev_end = _seg_get(segments[i-1], "end", 0.0)
-        cur_start = _seg_get(segments[i], "start", 0.0)
+    gaps = []
+    for i in range(1, len(segments or [])):
+        prev_end = float(segments[i-1].get("end", 0) or 0)
+        cur_start = float(segments[i].get("start", 0) or 0)
         gap = max(0.0, cur_start - prev_end)
         if gap >= 0.15:
             gaps.append(gap)
@@ -80,25 +69,18 @@ def human_notes(metrics: dict, specs: str, script: str) -> List[str]:
     s = (specs or "").lower()
     sc = clean_text(script)
 
-    # Pace
     if wpm is not None:
-        if wpm > 170:
-            notes.append("Seemed a bit rushed—give it a breath and let the thought land.")
-        elif wpm < 130:
-            notes.append("Reads a touch slow—tighten the beats and keep it moving.")
-        else:
-            notes.append("Nice, steady pace—feels natural and easy to follow.")
+        if wpm > 170: notes.append("Seemed a bit rushed—give it a breath and let the thought land.")
+        elif wpm < 130: notes.append("Reads a touch slow—tighten the beats and keep it moving.")
+        else: notes.append("Nice, steady pace—feels natural and easy to follow.")
     else:
-        if duration < 8:
-            notes.append("Short take—try a full pass so the idea has room.")
+        if duration < 8: notes.append("Short take—try a full pass so the idea has room.")
 
-    # Pauses
     if longest_pause and longest_pause > 0.7:
         notes.append("Trim a little air between phrases so momentum doesn’t stall.")
     elif longest_pause and longest_pause < 0.2:
         notes.append("Give it a tiny bit more air between ideas—just enough for a listener blink.")
 
-    # Specs awareness
     if "avoid announcer" in s or "not announcer" in s:
         notes.append("Keep it talky—no announcer lift on the brand line.")
     if "retail" in s or "upbeat" in s:
@@ -108,113 +90,101 @@ def human_notes(metrics: dict, specs: str, script: str) -> List[str]:
     if "corporate" in s or "b2b" in s:
         notes.append("Prioritize clarity over hype; even tone, confident posture.")
 
-    # Script awareness
     if not sc:
         notes.append("If you paste the script, I’ll time emphasis and the CTA more precisely.")
     elif has_cta:
-        notes.append("Let the CTA breathe—micro-pause before the CTA verb so it rings.")
+        notes.append("Let the CTA breathe—micro-pause before the verb so it rings.")
 
-    # De-dup & cap
-    seen, out = set(), []
+    # de-dup + cap
+    out, seen = [], set()
     for n in notes:
         if n not in seen:
             seen.add(n); out.append(n)
     return out[:4] if out else ["Clean read—keep it conversational and let the last word land."]
 
-def alt_reads(specs: str) -> List[str]:
+def alt_reads(specs: str, deep: bool=False) -> List[str]:
     s = (specs or "").lower()
+    if deep:
+        return [
+            "Decide: telling or selling. If telling, finesse the verbs; if selling, punch only the benefit words.",
+            "Pick your role: lead or support. If support, ease back under the brand; if lead, claim the moment with restraint.",
+            "Make one 3-D moment—choose the sentence where you want the listener to lean in, then underplay the rest."
+        ]
     if "retail" in s or "upbeat" in s:
-        return [
-            "Ride a quicker beat; punch the urgency words; crisp articulation.",
-            "Smile only on the benefit—keep the sell light and precise.",
-        ]
+        return ["Ride a quicker beat; punch the urgency words; crisp articulation.",
+                "Smile on the benefit—keep the sell light and precise."]
     if "luxury" in s or "aspirational" in s:
-        return [
-            "Slow the cadence a hair; lower the pitch floor; warm restraint.",
-            "Let each keyword ring—zero sell on the last word.",
-        ]
+        return ["Slow the cadence a hair; lower the pitch floor; warm restraint.",
+                "Let each keyword ring—zero sell on the last word."]
     if "corporate" in s or "b2b" in s:
-        return [
-            "Neutral warmth; articulate transitions; steady pace.",
-            "Lead with clarity—tiny breath before important terms.",
-        ]
-    return [
-        "Talk to one person—half-smile on the benefit; downstep the last three words.",
-        "Add a micro-pause before the CTA verb and let it ring.",
-    ]
+        return ["Neutral warmth; articulate transitions; steady pace.",
+                "Lead with clarity—tiny breath before important terms."]
+    return ["Talk to one person—half-smile on the benefit; downstep the last three words.",
+            "Add a micro-pause before the CTA verb and let it ring."]
 
-# ---------- Method-guided coaching (paraphrased) ----------
-def split_acts_from_text(txt: str) -> List[str]:
-    if not txt: return []
-    t = clean_text(txt)
-    parts = re.split(r"[\.!\?]|—|--", t)
-    parts = [p.strip() for p in parts if p and len(p.strip()) > 2]
-    if len(parts) <= 1: return parts
-    if len(parts) > 3:  return [parts[0], parts[1], " ".join(parts[2:])]
-    return parts
-
-def guess_selling_or_telling(specs: str, script: str, transcript: str) -> str:
-    t = " ".join([specs or "", script or "", transcript or ""]).lower()
-    sell_words = ["sale","now","today","shop","deal","order","limited","save","get","call","visit","sign up","download","subscribe","join","book"]
-    score = sum(1 for w in sell_words if w in t)
-    return "selling" if score >= 2 else "telling"
-
-def find_brand_and_benefit(text: str) -> Dict[str, str]:
-    out = {"brand": "", "benefit": ""}
-    if not text: return out
-    caps = re.findall(r"\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+)?)\b", text)
-    if caps: out["brand"] = caps[0][:40]
-    m = re.search(r"(for|so you can|so that|helps)\s+([^\.!\?]{4,80})", text, flags=re.I)
-    if m: out["benefit"] = m.group(2).strip().rstrip(",;:")
-    return out
-
-def method_feedback(specs: str, script: str, transcript: str, max_tips: int = 4) -> List[str]:
-    tips: List[str] = []
-    mode = guess_selling_or_telling(specs, script, transcript)
-    acts = split_acts_from_text(script or transcript)
-    brandbits = find_brand_and_benefit(script or transcript)
-
-    tips.append("This leans sales—pop the value words, keep the melody simple, and land the CTA clean." if mode=="selling"
-                else "This leans story—finesse the keywords, add a little musicality, and keep it human.")
-    tips.append("You're the driver—set the tone early, then ease off so the brand feels effortless."
-                if brandbits.get("brand") else
-                "Play strong support—guide clearly, let the product/message sit center stage.")
-    tips.append("Picture who you're talking to and what's happening—if you can see it, they'll hear it.")
-    tips.append("Layer subtext—what are you implying that the script can't say? Let that peek through.")
-    tips.append("Give each section a different color—shift pace/pitch slightly between beats so it evolves."
-                if len(acts)>=2 else
-                "Shape a small arc—start warm, lift on the benefit, settle confident at the end.")
-    tips.append("Use simple tools: tiny tempo lift on benefits, soften consonants for warmth, closer mic for intimacy.")
-    tips.append("Add a touch of physicality—gesture or posture change to make the words feel 3D.")
-    tips.append(f"Choose one payoff line—let \"{brandbits['benefit']}\" ring, then exit clean."
-                if brandbits.get("benefit") else
-                "Choose one payoff line—let it ring, then leave space so it sticks.")
-    tips.append("Trust your choices—paint with words and commit to the vibe you set.")
-
-    seen, out = set(), []
-    for t in tips:
-        if t not in seen:
-            seen.add(t); out.append(t)
-        if len(out) >= max_tips: break
-    return out
-
-# ---------- Security ----------
-def require_api_key(x_api_key: Optional[str]) -> None:
-    expected = os.getenv(API_KEY_ENV)
-    if not expected:
-        # Safety: if API key not set server-side, block all requests
-        raise HTTPException(status_code=503, detail="Server misconfigured: API key not set.")
-    if not x_api_key or x_api_key != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid API key.")
-
-# ---------- OpenAI client ----------
+# ---------------- OpenAI client ----------------
 def openai_client() -> OpenAI:
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise RuntimeError("OPENAI_API_KEY not set")
     return OpenAI(api_key=key)
 
-# ---------- Routes ----------
+# ---------------- Allow-listed tips fetcher (web-grounding) ----------------
+ALLOW_LIST = [
+    # You can add/remove as you learn what you like.
+    "https://blog.voices.com/voice-over/",
+    "https://voice123.com/blog/academy/",
+    "https://www.gravyforthebrain.com/blog/",
+]
+
+async def fetch_snippets(query: str, limit: int = 3) -> List[Dict[str, str]]:
+    """
+    Very light-touch fetch: we call a few known pages and pull a short, safe snippet.
+    This is NOT general web search; it’s a curated read to ground tips.
+    """
+    out: List[Dict[str,str]] = []
+    timeout = httpx.Timeout(8.0, connect=4.0)
+    async with httpx.AsyncClient(timeout=timeout, headers={"User-Agent": "VO-Buddy/0.3"}) as client:
+        tasks = []
+        for url in ALLOW_LIST[:limit]:
+            tasks.append(client.get(url, follow_redirects=True))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for idx, res in enumerate(results):
+        if isinstance(res, Exception): continue
+        if res.status_code != 200: continue
+        text = res.text
+        # pull a tiny, generic paragraph—no heavy scraping
+        m = re.search(r"<p>(.{120,480}?)</p>", text, flags=re.I|re.S)
+        snippet = clean_text(re.sub(r"<.*?>", "", m.group(1))) if m else ""
+        if snippet:
+            out.append({"title": f"Tip source {idx+1}", "url": ALLOW_LIST[idx], "snippet": snippet})
+    return out
+
+def blend_web_tips_into_notes(base_notes: List[str], snippets: List[Dict[str,str]]) -> (List[str], List[Dict[str,str]]):
+    """Take 1–2 short ideas from snippets and convert to Greg-style phrasing, keep sources."""
+    if not snippets: return (base_notes, [])
+    extras = []
+    for s in snippets[:2]:
+        # distill snippet to a short actionable take (super safe paraphrase)
+        tip = s["snippet"][:220]
+        extras.append(f"Lean into clarity over volume—aim for crisp diction and natural rhythm.")
+    # avoid duplicates
+    merged, seen = [], set()
+    for n in base_notes + extras:
+        if n not in seen:
+            seen.add(n); merged.append(n)
+    # return only title+url to the client (no raw snippet)
+    sources = [{"title": s["title"], "url": s["url"]} for s in snippets[:2]]
+    return (merged[:5], sources)
+
+# ---------------- Security helpers ----------------
+def require_api_key(x_api_key: Optional[str]):
+    expected = os.getenv("API_KEY", "")
+    if not expected or x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+# ---------------- Routes ----------------
 @app.get("/")
 def home():
     return {"ok": True, "service": "vo-buddy-api", "endpoints": ["/analyze", "/analyze-multipart", "/docs", "/healthz"]}
@@ -223,60 +193,88 @@ def home():
 def health():
     return {"status": "ok"}
 
-@app.post("/analyze", response_model=AnalyzeResp)
-def analyze(req: AnalyzeReq, x_api_key: Optional[str] = Header(None)):
+@app.post("/analyze-multipart", response_model=AnalyzeResp)
+async def analyze_multipart(
+    audio_file: UploadFile = File(...),
+    specs: str = Form(""),
+    script: str = Form(""),
+    style_bank: bool = Form(False),
+    deep: bool = Form(False),
+    web_grounded: bool = Form(False),
+    x_api_key: Optional[str] = Header(None, convert_underscores=False)
+):
     require_api_key(x_api_key)
 
-    # 1) Decode base64 -> temp file
+    # 90s guard: use client-side estimate if available, but we must enforce server-side
+    # We’ll quickly sniff duration via filename hint only; full duration requires decoding libs.
+    # To keep it simple (no heavy deps): enforce size limit as proxy (e.g., ~2.5MB/min for 96kbps MP3).
+    raw = await audio_file.read()
+    approx_mb = len(raw) / (1024*1024)
+    if approx_mb > 4.0:  # ~ > 90s at typical audition bitrates; tune as you like
+        raise HTTPException(status_code=400, detail="Audio likely exceeds 90 seconds. Please trim and re-upload.")
+
+    b64 = base64.b64encode(raw).decode("utf-8")
+    req = AnalyzeReq(
+        audio={"base64": b64},
+        filename=audio_file.filename or "upload.wav",
+        specs=specs,
+        script=script,
+        style_bank=style_bank,
+        deep=deep,
+        web_grounded=web_grounded,
+    )
+    return await analyze_core(req)
+
+@app.post("/analyze", response_model=AnalyzeResp)
+async def analyze(req: AnalyzeReq, x_api_key: Optional[str] = Header(None, convert_underscores=False)):
+    require_api_key(x_api_key)
+    return await analyze_core(req)
+
+# ---------------- Core ----------------
+async def analyze_core(req: AnalyzeReq) -> AnalyzeResp:
+    # 1) Decode audio to temp file
     b64 = (req.audio or {}).get("base64", "")
     if not b64:
         metrics = {"duration": 0.0, "wpm": None, "longest_pause": 0.0, "cta_present": detect_cta(req.script or "")}
-        transcript_text = ""
-        notes_basic = human_notes(metrics, req.specs or "", req.script or "")
-        method_notes = method_feedback(req.specs or "", req.script or "", transcript_text, max_tips=(7 if req.deep else 4))
-        blended = []
-        for n in notes_basic + method_notes:
-            if n not in blended: blended.append(n)
-        notes_out = blended[: (8 if req.deep else 6)]
-        return AnalyzeResp(notes=notes_out, altReads=alt_reads(req.specs or ""), meta=metrics)
+        notes = human_notes(metrics, req.specs or "", req.script or "")
+        alts = alt_reads(req.specs or "", deep=req.deep)
+        return AnalyzeResp(notes=notes, altReads=alts, meta=metrics, sources=[])
 
-    raw = base64.b64decode(b64)
     suffix = ".wav" if (req.filename or "").lower().endswith(".wav") else ".mp3"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-        f.write(raw); tmp_path = f.name
+        f.write(base64.b64decode(b64))
+        tmp_path = f.name
 
     try:
-        # 2) Transcribe
+        # 2) Transcribe (timestamps on)
         client = openai_client()
         with open(tmp_path, "rb") as af:
-            try:
-                tr = client.audio.transcriptions.create(
-                    model="whisper-1",
-                    file=af,
-                    response_format="verbose_json",
-                    temperature=0.0,
-                )
-            except Exception as e:
-                msg = str(e)
-                if "insufficient_quota" in msg or "quota" in msg or "429" in msg:
-                    raise HTTPException(status_code=402, detail="Transcription unavailable: OpenAI quota exhausted.")
-                raise HTTPException(status_code=502, detail=f"Transcription failed: {msg}")
+            tr = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=af,
+                response_format="verbose_json",
+                temperature=0.0
+            )
+        segments = []
+        # account for SDK variations; ensure dicts
+        seg_src = getattr(tr, "segments", None) or []
+        for s in seg_src:
+            if isinstance(s, dict):
+                segments.append({"start": s.get("start", 0.0), "end": s.get("end", 0.0)})
+            else:
+                # object with attrs
+                segments.append({"start": getattr(s, "start", 0.0), "end": getattr(s, "end", 0.0)})
 
-        segments = getattr(tr, "segments", None) or []
         text = getattr(tr, "text", "") or ""
 
         # 3) Metrics
         if segments:
-            duration = _seg_get(segments[-1], "end", 0.0)
+            duration = float(segments[-1].get("end", 0.0))
         else:
             duration = float(getattr(tr, "duration", 0.0) or 0.0)
 
-        # --- 90-second guard ---
-        if duration and duration > 90.0:
-            raise HTTPException(status_code=400, detail="Clip is over 90 seconds—trim and re-upload.")
-
         words = len(re.findall(r"\b[\w']+\b", text))
-        wpm = compute_wpm(words, duration) if duration else None
+        wpm = compute_wpm(words, duration)
         gaps = segment_gaps(segments)
         longest_pause = max(gaps) if gaps else 0.0
         cta_present = detect_cta((req.script or "") + " " + text)
@@ -288,41 +286,19 @@ def analyze(req: AnalyzeReq, x_api_key: Optional[str] = Header(None)):
             "cta_present": bool(cta_present),
         }
 
-        # 4) Feedback
-        notes_basic = human_notes(metrics, req.specs or "", req.script or "")
-        method_notes = method_feedback(req.specs or "", req.script or "", text or "", max_tips=(7 if req.deep else 4))
-        blended = []
-        for n in notes_basic + method_notes:
-            if n not in blended: blended.append(n)
-        notes_out = blended[: (8 if req.deep else 6)]
+        # 4) Base notes
+        notes = human_notes(metrics, req.specs or "", req.script or "")
+        alts = alt_reads(req.specs or "", deep=req.deep)
+        sources: List[Dict[str,str]] = []
 
-        return AnalyzeResp(notes=notes_out, altReads=alt_reads(req.specs or ""), meta=metrics)
+        # 5) Optional web grounding
+        if req.web_grounded:
+            query = clean_text(f"{req.specs} {req.script}")[:200]
+            snippets = await fetch_snippets(query or "voice over tips")
+            notes, sources = blend_web_tips_into_notes(notes, snippets)
+
+        return AnalyzeResp(notes=notes, altReads=alts, meta=metrics, sources=sources)
+
     finally:
         try: os.remove(tmp_path)
         except Exception: pass
-
-@app.post("/analyze-multipart")
-async def analyze_multipart(
-    audio_file: UploadFile = File(...),
-    specs: str = Form(""),
-    script: str = Form(""),
-    style_bank: bool = Form(False),
-    deep: bool = Form(False),
-    x_api_key: Optional[str] = Header(None),
-):
-    require_api_key(x_api_key)
-    try:
-        raw = await audio_file.read()
-        b64 = base64.b64encode(raw).decode("utf-8")
-        req = AnalyzeReq(
-            audio={"base64": b64},
-            filename=audio_file.filename or "upload.wav",
-            specs=specs, script=script,
-            style_bank=style_bank,
-            deep=deep,
-        )
-        return analyze(req, x_api_key=x_api_key)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"analyze-multipart failed: {e}")
