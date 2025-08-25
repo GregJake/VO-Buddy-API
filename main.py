@@ -1,21 +1,25 @@
 # main.py
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, List, Any
 from openai import OpenAI
+import base64, tempfile, os, re
 
-import base64
-import tempfile
-import os
-import re
+# --- Configure your allowed origins ---
+ALLOWED_ORIGINS = [
+    "https://voboothbuddy.com",
+    "https://www.voboothbuddy.com",
+    # add your Wix site preview origin if needed, e.g. "https://editor.wix.com"
+]
 
-app = FastAPI(title="VO Buddy API", version="0.3.1")
+API_KEY_ENV = "API_KEY"  # set this env var in Render
+
+app = FastAPI(title="VO Buddy API", version="0.4.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your domain once stable
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,13 +27,12 @@ app.add_middleware(
 
 # ---------- Models ----------
 class AnalyzeReq(BaseModel):
-    # expects: {"audio": {"base64": "..."}}
-    audio: Dict[str, str]
+    audio: Dict[str, str]              # {"base64": "..."}
     filename: Optional[str] = None
     specs: Optional[str] = ""
     script: Optional[str] = ""
     style_bank: Optional[bool] = False
-    deep: Optional[bool] = False   # Deep coaching toggle
+    deep: Optional[bool] = False
 
 class AnalyzeResp(BaseModel):
     notes: List[str]
@@ -38,16 +41,14 @@ class AnalyzeResp(BaseModel):
 
 # ---------- Utils ----------
 CTA_WORDS = {
-    "call", "visit", "today", "now", "shop", "learn", "sign",
-    "download", "subscribe", "join", "try", "order", "book"
+    "call","visit","today","now","shop","learn","sign","download","subscribe","join","try","order","book"
 }
 
 def clean_text(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 def detect_cta(text: str) -> bool:
-    t = (text or "").lower()
-    return any(w in t for w in CTA_WORDS)
+    return any(w in (text or "").lower() for w in CTA_WORDS)
 
 def compute_wpm(word_count: int, duration_s: float) -> Optional[float]:
     if duration_s <= 0 or word_count <= 0:
@@ -55,24 +56,21 @@ def compute_wpm(word_count: int, duration_s: float) -> Optional[float]:
     return (word_count / duration_s) * 60.0
 
 def _seg_get(seg: Any, field: str, default: float = 0.0) -> float:
-    """Read segment fields from either a dict or an object with attributes."""
     if isinstance(seg, dict):
         return float(seg.get(field, default) or 0.0)
     return float(getattr(seg, field, default) or 0.0)
 
 def segment_gaps(segments) -> List[float]:
-    """Return list of pauses between segments in seconds."""
     gaps: List[float] = []
     for i in range(1, len(segments)):
-        prev_end = _seg_get(segments[i - 1], "end", 0.0)
+        prev_end = _seg_get(segments[i-1], "end", 0.0)
         cur_start = _seg_get(segments[i], "start", 0.0)
         gap = max(0.0, cur_start - prev_end)
-        if gap >= 0.15:  # ignore micro gaps
+        if gap >= 0.15:
             gaps.append(gap)
     return gaps
 
 def human_notes(metrics: dict, specs: str, script: str) -> List[str]:
-    """Map metrics/specs/script to Greg-style notes (no hard numbers)."""
     notes: List[str] = []
     wpm = metrics.get("wpm")
     longest_pause = metrics.get("longest_pause", 0.0)
@@ -116,12 +114,11 @@ def human_notes(metrics: dict, specs: str, script: str) -> List[str]:
     elif has_cta:
         notes.append("Let the CTA breathe—micro-pause before the CTA verb so it rings.")
 
-    # De-dup and cap
+    # De-dup & cap
     seen, out = set(), []
     for n in notes:
         if n not in seen:
-            seen.add(n)
-            out.append(n)
+            seen.add(n); out.append(n)
     return out[:4] if out else ["Clean read—keep it conversational and let the last word land."]
 
 def alt_reads(specs: str) -> List[str]:
@@ -148,103 +145,67 @@ def alt_reads(specs: str) -> List[str]:
 
 # ---------- Method-guided coaching (paraphrased) ----------
 def split_acts_from_text(txt: str) -> List[str]:
-    """
-    Naive 'acts' splitter: break on sentence boundaries and long dashes; return 2–3 chunks.
-    """
-    if not txt:
-        return []
+    if not txt: return []
     t = clean_text(txt)
     parts = re.split(r"[\.!\?]|—|--", t)
     parts = [p.strip() for p in parts if p and len(p.strip()) > 2]
-    if len(parts) <= 1:
-        return parts
-    if len(parts) > 3:
-        return [parts[0], parts[1], " ".join(parts[2:])]
+    if len(parts) <= 1: return parts
+    if len(parts) > 3:  return [parts[0], parts[1], " ".join(parts[2:])]
     return parts
 
 def guess_selling_or_telling(specs: str, script: str, transcript: str) -> str:
     t = " ".join([specs or "", script or "", transcript or ""]).lower()
-    sell_signals = [
-        "sale", "now", "today", "shop", "deal", "order", "limited",
-        "save", "get", "call", "visit", "sign up", "download", "subscribe",
-        "join", "book"
-    ]
-    score = sum(1 for w in sell_signals if w in t)
+    sell_words = ["sale","now","today","shop","deal","order","limited","save","get","call","visit","sign up","download","subscribe","join","book"]
+    score = sum(1 for w in sell_words if w in t)
     return "selling" if score >= 2 else "telling"
 
 def find_brand_and_benefit(text: str) -> Dict[str, str]:
-    """
-    Light guess: brand-like tokens (Capitalized Words) and benefit phrases near 'for/so you can/helps'.
-    """
     out = {"brand": "", "benefit": ""}
-    if not text:
-        return out
+    if not text: return out
     caps = re.findall(r"\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+)?)\b", text)
-    if caps:
-        out["brand"] = caps[0][:40]
+    if caps: out["brand"] = caps[0][:40]
     m = re.search(r"(for|so you can|so that|helps)\s+([^\.!\?]{4,80})", text, flags=re.I)
-    if m:
-        out["benefit"] = m.group(2).strip().rstrip(",;:")
+    if m: out["benefit"] = m.group(2).strip().rstrip(",;:")
     return out
 
 def method_feedback(specs: str, script: str, transcript: str, max_tips: int = 4) -> List[str]:
-    """
-    Paraphrased method → friendly coaching prompts in Greg's voice (non-verbatim).
-    """
     tips: List[str] = []
     mode = guess_selling_or_telling(specs, script, transcript)
     acts = split_acts_from_text(script or transcript)
     brandbits = find_brand_and_benefit(script or transcript)
 
-    # 1) Telling vs. Selling
-    if mode == "selling":
-        tips.append("This leans sales—pop the value words, keep the melody simple, and land the CTA clean.")
-    else:
-        tips.append("This leans story—finesse the keywords, add a little musicality, and keep it human.")
-
-    # 2) Lead vs. Support
-    leadish = bool(brandbits.get("brand"))
-    if leadish:
-        tips.append("You're the driver—set the tone early, then ease off so the brand feels effortless.")
-    else:
-        tips.append("Play strong support—guide clearly, let the product/message sit center stage.")
-
-    # 3) Scene/Listener
+    tips.append("This leans sales—pop the value words, keep the melody simple, and land the CTA clean." if mode=="selling"
+                else "This leans story—finesse the keywords, add a little musicality, and keep it human.")
+    tips.append("You're the driver—set the tone early, then ease off so the brand feels effortless."
+                if brandbits.get("brand") else
+                "Play strong support—guide clearly, let the product/message sit center stage.")
     tips.append("Picture who you're talking to and what's happening—if you can see it, they'll hear it.")
-
-    # 4) Subtext
     tips.append("Layer subtext—what are you implying that the script can't say? Let that peek through.")
-
-    # 5) Feeling arc + Acts
-    if len(acts) >= 2:
-        tips.append("Give each section a different color—shift pace/pitch slightly between beats so it evolves.")
-    else:
-        tips.append("Shape a small arc—start warm, lift on the benefit, settle confident at the end.")
-
-    # 6) Tools to differentiate
-    tips.append("Use simple tools: tiny tempo lift on benefits, soften consonants on warmth, closer mic for intimacy.")
-
-    # 7) Physicality
+    tips.append("Give each section a different color—shift pace/pitch slightly between beats so it evolves."
+                if len(acts)>=2 else
+                "Shape a small arc—start warm, lift on the benefit, settle confident at the end.")
+    tips.append("Use simple tools: tiny tempo lift on benefits, soften consonants for warmth, closer mic for intimacy.")
     tips.append("Add a touch of physicality—gesture or posture change to make the words feel 3D.")
-
-    # 8) Make a 'moment'
-    if brandbits.get("benefit"):
-        tips.append(f"Choose one payoff line—let \"{brandbits['benefit']}\" ring, then exit clean.")
-    else:
-        tips.append("Choose one payoff line—let it ring, then leave space so it sticks.")
-
-    # 9) Confidence wrap
+    tips.append(f"Choose one payoff line—let \"{brandbits['benefit']}\" ring, then exit clean."
+                if brandbits.get("benefit") else
+                "Choose one payoff line—let it ring, then leave space so it sticks.")
     tips.append("Trust your choices—paint with words and commit to the vibe you set.")
 
-    # De-dup and cap
     seen, out = set(), []
     for t in tips:
         if t not in seen:
-            seen.add(t)
-            out.append(t)
-        if len(out) >= max_tips:
-            break
+            seen.add(t); out.append(t)
+        if len(out) >= max_tips: break
     return out
+
+# ---------- Security ----------
+def require_api_key(x_api_key: Optional[str]) -> None:
+    expected = os.getenv(API_KEY_ENV)
+    if not expected:
+        # Safety: if API key not set server-side, block all requests
+        raise HTTPException(status_code=503, detail="Server misconfigured: API key not set.")
+    if not x_api_key or x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid API key.")
 
 # ---------- OpenAI client ----------
 def openai_client() -> OpenAI:
@@ -263,70 +224,56 @@ def health():
     return {"status": "ok"}
 
 @app.post("/analyze", response_model=AnalyzeResp)
-def analyze(req: AnalyzeReq):
-    """
-    1) Decode base64 -> temp file
-    2) Transcribe with whisper-1 (timestamps on)
-    3) Compute duration, wpm, pause stats
-    4) Map to Greg-style notes + method-guided prompts + alt reads
-    """
-    # --- 1) decode audio to temp file
+def analyze(req: AnalyzeReq, x_api_key: Optional[str] = Header(None)):
+    require_api_key(x_api_key)
+
+    # 1) Decode base64 -> temp file
     b64 = (req.audio or {}).get("base64", "")
     if not b64:
-        # Graceful fallback: no audio posted
-        metrics = {
-            "duration": 0.0,
-            "wpm": None,
-            "longest_pause": 0.0,
-            "cta_present": detect_cta(req.script or "")
-        }
+        metrics = {"duration": 0.0, "wpm": None, "longest_pause": 0.0, "cta_present": detect_cta(req.script or "")}
         transcript_text = ""
-        # Build notes
         notes_basic = human_notes(metrics, req.specs or "", req.script or "")
         method_notes = method_feedback(req.specs or "", req.script or "", transcript_text, max_tips=(7 if req.deep else 4))
         blended = []
         for n in notes_basic + method_notes:
-            if n not in blended:
-                blended.append(n)
+            if n not in blended: blended.append(n)
         notes_out = blended[: (8 if req.deep else 6)]
-        alts = alt_reads(req.specs or "")
-        return AnalyzeResp(notes=notes_out, altReads=alts, meta=metrics)
+        return AnalyzeResp(notes=notes_out, altReads=alt_reads(req.specs or ""), meta=metrics)
 
     raw = base64.b64decode(b64)
     suffix = ".wav" if (req.filename or "").lower().endswith(".wav") else ".mp3"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-        f.write(raw)
-        tmp_path = f.name
+        f.write(raw); tmp_path = f.name
 
     try:
-        # --- 2) transcription
+        # 2) Transcribe
         client = openai_client()
         with open(tmp_path, "rb") as af:
             try:
                 tr = client.audio.transcriptions.create(
                     model="whisper-1",
                     file=af,
-                    response_format="verbose_json",   # returns segments with start/end
+                    response_format="verbose_json",
                     temperature=0.0,
                 )
             except Exception as e:
                 msg = str(e)
                 if "insufficient_quota" in msg or "quota" in msg or "429" in msg:
-                    raise HTTPException(
-                        status_code=402,
-                        detail="Transcription is temporarily unavailable: OpenAI quota exhausted. Add billing or raise limit and try again."
-                    )
+                    raise HTTPException(status_code=402, detail="Transcription unavailable: OpenAI quota exhausted.")
                 raise HTTPException(status_code=502, detail=f"Transcription failed: {msg}")
 
         segments = getattr(tr, "segments", None) or []
         text = getattr(tr, "text", "") or ""
 
-        # --- 3) metrics from segments
+        # 3) Metrics
         if segments:
             duration = _seg_get(segments[-1], "end", 0.0)
         else:
-            # Some SDKs expose duration; if not, leave 0.0
             duration = float(getattr(tr, "duration", 0.0) or 0.0)
+
+        # --- 90-second guard ---
+        if duration and duration > 90.0:
+            raise HTTPException(status_code=400, detail="Clip is over 90 seconds—trim and re-upload.")
 
         words = len(re.findall(r"\b[\w']+\b", text))
         wpm = compute_wpm(words, duration) if duration else None
@@ -341,53 +288,40 @@ def analyze(req: AnalyzeReq):
             "cta_present": bool(cta_present),
         }
 
-        # --- 4) map to human notes + method-guided prompts
+        # 4) Feedback
         notes_basic = human_notes(metrics, req.specs or "", req.script or "")
-        transcript_text = text or ""
-        method_notes = method_feedback(req.specs or "", req.script or "", transcript_text, max_tips=(7 if req.deep else 4))
-
+        method_notes = method_feedback(req.specs or "", req.script or "", text or "", max_tips=(7 if req.deep else 4))
         blended = []
         for n in notes_basic + method_notes:
-            if n not in blended:
-                blended.append(n)
+            if n not in blended: blended.append(n)
         notes_out = blended[: (8 if req.deep else 6)]
 
-        alts = alt_reads(req.specs or "")
-        return AnalyzeResp(notes=notes_out, altReads=alts, meta=metrics)
-
+        return AnalyzeResp(notes=notes_out, altReads=alt_reads(req.specs or ""), meta=metrics)
     finally:
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
+        try: os.remove(tmp_path)
+        except Exception: pass
 
-# ---------- Multipart endpoint (file upload) ----------
 @app.post("/analyze-multipart")
 async def analyze_multipart(
     audio_file: UploadFile = File(...),
     specs: str = Form(""),
     script: str = Form(""),
     style_bank: bool = Form(False),
-    deep: bool = Form(False),   # Deep tips toggle from form (Wix checkbox)
+    deep: bool = Form(False),
+    x_api_key: Optional[str] = Header(None),
 ):
-    """
-    Accepts a real file upload from the browser (multipart/form-data),
-    converts it to base64 internally, and routes to the same analyzer.
-    """
+    require_api_key(x_api_key)
     try:
         raw = await audio_file.read()
         b64 = base64.b64encode(raw).decode("utf-8")
-
         req = AnalyzeReq(
             audio={"base64": b64},
             filename=audio_file.filename or "upload.wav",
-            specs=specs,
-            script=script,
+            specs=specs, script=script,
             style_bank=style_bank,
             deep=deep,
         )
-        # Reuse the same logic as the JSON endpoint
-        return analyze(req)
+        return analyze(req, x_api_key=x_api_key)
     except HTTPException:
         raise
     except Exception as e:
