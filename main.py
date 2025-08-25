@@ -11,7 +11,7 @@ import tempfile
 import os
 import re
 
-app = FastAPI(title="VO Buddy API", version="0.2.2")
+app = FastAPI(title="VO Buddy API", version="0.3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,7 +29,7 @@ class AnalyzeReq(BaseModel):
     specs: Optional[str] = ""
     script: Optional[str] = ""
     style_bank: Optional[bool] = False
-
+    deep: Optional[bool] = False   # Deep coaching toggle
 
 class AnalyzeResp(BaseModel):
     notes: List[str]
@@ -114,7 +114,7 @@ def human_notes(metrics: dict, specs: str, script: str) -> List[str]:
     if not sc:
         notes.append("If you paste the script, I’ll time emphasis and the CTA more precisely.")
     elif has_cta:
-        notes.append("Let the CTA breathe—micro-pause before the verb so it rings.")
+        notes.append("Let the CTA breathe—micro-pause before the CTA verb so it rings.")
 
     # De-dup and cap
     seen, out = set(), []
@@ -146,6 +146,106 @@ def alt_reads(specs: str) -> List[str]:
         "Add a micro-pause before the CTA verb and let it ring.",
     ]
 
+# ---------- Method-guided coaching (paraphrased) ----------
+def split_acts_from_text(txt: str) -> List[str]:
+    """
+    Naive 'acts' splitter: break on sentence boundaries and long dashes; return 2–3 chunks.
+    """
+    if not txt:
+        return []
+    t = clean_text(txt)
+    parts = re.split(r"[\.!\?]|—|--", t)
+    parts = [p.strip() for p in parts if p and len(p.strip()) > 2]
+    if len(parts) <= 1:
+        return parts
+    if len(parts) > 3:
+        return [parts[0], parts[1], " ".join(parts[2:])]
+    return parts
+
+def guess_selling_or_telling(specs: str, script: str, transcript: str) -> str:
+    t = " ".join([specs or "", script or "", transcript or ""]).lower()
+    sell_signals = [
+        "sale", "now", "today", "shop", "deal", "order", "limited",
+        "save", "get", "call", "visit", "sign up", "download", "subscribe",
+        "join", "book"
+    ]
+    score = sum(1 for w in sell_signals if w in t)
+    return "selling" if score >= 2 else "telling"
+
+def find_brand_and_benefit(text: str) -> Dict[str, str]:
+    """
+    Light guess: brand-like tokens (Capitalized Words) and benefit phrases near 'for/so you can/helps'.
+    """
+    out = {"brand": "", "benefit": ""}
+    if not text:
+        return out
+    caps = re.findall(r"\b([A-Z][a-zA-Z0-9]+(?:\s+[A-Z][a-zA-Z0-9]+)?)\b", text)
+    if caps:
+        out["brand"] = caps[0][:40]
+    m = re.search(r"(for|so you can|so that|helps)\s+([^\.!\?]{4,80})", text, flags=re.I)
+    if m:
+        out["benefit"] = m.group(2).strip().rstrip(",;:")
+    return out
+
+def method_feedback(specs: str, script: str, transcript: str, max_tips: int = 4) -> List[str]:
+    """
+    Paraphrased method → friendly coaching prompts in Greg's voice (non-verbatim).
+    """
+    tips: List[str] = []
+    mode = guess_selling_or_telling(specs, script, transcript)
+    acts = split_acts_from_text(script or transcript)
+    brandbits = find_brand_and_benefit(script or transcript)
+
+    # 1) Telling vs. Selling
+    if mode == "selling":
+        tips.append("This leans sales—pop the value words, keep the melody simple, and land the CTA clean.")
+    else:
+        tips.append("This leans story—finesse the keywords, add a little musicality, and keep it human.")
+
+    # 2) Lead vs. Support
+    leadish = bool(brandbits.get("brand"))
+    if leadish:
+        tips.append("You're the driver—set the tone early, then ease off so the brand feels effortless.")
+    else:
+        tips.append("Play strong support—guide clearly, let the product/message sit center stage.")
+
+    # 3) Scene/Listener
+    tips.append("Picture who you're talking to and what's happening—if you can see it, they'll hear it.")
+
+    # 4) Subtext
+    tips.append("Layer subtext—what are you implying that the script can't say? Let that peek through.")
+
+    # 5) Feeling arc + Acts
+    if len(acts) >= 2:
+        tips.append("Give each section a different color—shift pace/pitch slightly between beats so it evolves.")
+    else:
+        tips.append("Shape a small arc—start warm, lift on the benefit, settle confident at the end.")
+
+    # 6) Tools to differentiate
+    tips.append("Use simple tools: tiny tempo lift on benefits, soften consonants on warmth, closer mic for intimacy.")
+
+    # 7) Physicality
+    tips.append("Add a touch of physicality—gesture or posture change to make the words feel 3D.")
+
+    # 8) Make a 'moment'
+    if brandbits.get("benefit"):
+        tips.append(f"Choose one payoff line—let \"{brandbits['benefit']}\" ring, then exit clean.")
+    else:
+        tips.append("Choose one payoff line—let it ring, then leave space so it sticks.")
+
+    # 9) Confidence wrap
+    tips.append("Trust your choices—paint with words and commit to the vibe you set.")
+
+    # De-dup and cap
+    seen, out = set(), []
+    for t in tips:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+        if len(out) >= max_tips:
+            break
+    return out
+
 # ---------- OpenAI client ----------
 def openai_client() -> OpenAI:
     key = os.getenv("OPENAI_API_KEY")
@@ -168,7 +268,7 @@ def analyze(req: AnalyzeReq):
     1) Decode base64 -> temp file
     2) Transcribe with whisper-1 (timestamps on)
     3) Compute duration, wpm, pause stats
-    4) Map to Greg-style notes + alt reads
+    4) Map to Greg-style notes + method-guided prompts + alt reads
     """
     # --- 1) decode audio to temp file
     b64 = (req.audio or {}).get("base64", "")
@@ -180,11 +280,17 @@ def analyze(req: AnalyzeReq):
             "longest_pause": 0.0,
             "cta_present": detect_cta(req.script or "")
         }
-        return AnalyzeResp(
-            notes=human_notes(metrics, req.specs or "", req.script or ""),
-            altReads=alt_reads(req.specs or ""),
-            meta=metrics,
-        )
+        transcript_text = ""
+        # Build notes
+        notes_basic = human_notes(metrics, req.specs or "", req.script or "")
+        method_notes = method_feedback(req.specs or "", req.script or "", transcript_text, max_tips=(7 if req.deep else 4))
+        blended = []
+        for n in notes_basic + method_notes:
+            if n not in blended:
+                blended.append(n)
+        notes_out = blended[: (8 if req.deep else 6)]
+        alts = alt_reads(req.specs or "")
+        return AnalyzeResp(notes=notes_out, altReads=alts, meta=metrics)
 
     raw = base64.b64decode(b64)
     suffix = ".wav" if (req.filename or "").lower().endswith(".wav") else ".mp3"
@@ -204,7 +310,6 @@ def analyze(req: AnalyzeReq):
                     temperature=0.0,
                 )
             except Exception as e:
-                # friendlier surface
                 msg = str(e)
                 if "insufficient_quota" in msg or "quota" in msg or "429" in msg:
                     raise HTTPException(
@@ -220,10 +325,11 @@ def analyze(req: AnalyzeReq):
         if segments:
             duration = _seg_get(segments[-1], "end", 0.0)
         else:
+            # Some SDKs expose duration; if not, leave 0.0
             duration = float(getattr(tr, "duration", 0.0) or 0.0)
 
         words = len(re.findall(r"\b[\w']+\b", text))
-        wpm = compute_wpm(words, duration)
+        wpm = compute_wpm(words, duration) if duration else None
         gaps = segment_gaps(segments)
         longest_pause = max(gaps) if gaps else 0.0
         cta_present = detect_cta((req.script or "") + " " + text)
@@ -235,10 +341,19 @@ def analyze(req: AnalyzeReq):
             "cta_present": bool(cta_present),
         }
 
-        # --- 4) map to human notes
-        notes = human_notes(metrics, req.specs or "", req.script or "")
+        # --- 4) map to human notes + method-guided prompts
+        notes_basic = human_notes(metrics, req.specs or "", req.script or "")
+        transcript_text = text or ""
+        method_notes = method_feedback(req.specs or "", req.script or "", transcript_text, max_tips=(7 if req.deep else 4))
+
+        blended = []
+        for n in notes_basic + method_notes:
+            if n not in blended:
+                blended.append(n)
+        notes_out = blended[: (8 if req.deep else 6)]
+
         alts = alt_reads(req.specs or "")
-        return AnalyzeResp(notes=notes, altReads=alts, meta=metrics)
+        return AnalyzeResp(notes=notes_out, altReads=alts, meta=metrics)
 
     finally:
         try:
@@ -253,6 +368,7 @@ async def analyze_multipart(
     specs: str = Form(""),
     script: str = Form(""),
     style_bank: bool = Form(False),
+    deep: bool = Form(False),   # Deep tips toggle from form (Wix checkbox)
 ):
     """
     Accepts a real file upload from the browser (multipart/form-data),
@@ -268,6 +384,7 @@ async def analyze_multipart(
             specs=specs,
             script=script,
             style_bank=style_bank,
+            deep=deep,
         )
         # Reuse the same logic as the JSON endpoint
         return analyze(req)
